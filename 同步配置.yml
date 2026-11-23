@@ -1,0 +1,121 @@
+name: 同步上游仓库
+
+on:
+  schedule:
+    # 每天 23:00（北京时间）= UTC 15:00，改时间用 UTC（北京时减 8）
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制执行（即使无变化也重建）"
+        type: boolean
+        default: false
+
+# 允许本 workflow 推送回本仓库
+permissions:
+  contents: write
+  actions: write
+
+# 同一分支不并发跑
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ==========================================================
+  #  ★ 换源只改这一行 ★
+  #  格式:  作者/仓库名@分支
+  #  示例:  qist/tvbox@master
+  #         Jsnzkpg/Jsnzkpg@Jsnzkpg
+  # ==========================================================
+  UPSTREAM_SOURCE: "Jsnzkpg/Jsnzkpg@Jsnzkpg"
+  # ----------------------------------------------------------
+  # 以下按需要改，一般不用动
+  LOCAL_BRANCH: "main"     # 本仓库分支（你的是 main）
+  SKIP_WORKFLOWS: "true"   # true=丢掉上游 .github，避免白跑
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.LOCAL_BRANCH }}
+
+      - name: 解析并校验配置
+        run: |
+          set -e
+          SRC="${{ env.UPSTREAM_SOURCE }}"
+          UPSTREAM_REPO="${SRC%@*}"
+          UPSTREAM_BRANCH="${SRC#*@}"
+          if [ -z "$UPSTREAM_REPO" ] || [ "$UPSTREAM_REPO" = "$SRC" ]; then
+            echo "Error: UPSTREAM_SOURCE 格式应为 作者/仓库名@分支"
+            exit 1
+          fi
+          if [ -z "$UPSTREAM_BRANCH" ] || [ "$UPSTREAM_BRANCH" = "$UPSTREAM_REPO" ]; then
+            UPSTREAM_BRANCH="master"
+          fi
+          echo "UPSTREAM_REPO    = $UPSTREAM_REPO"
+          echo "UPSTREAM_BRANCH  = $UPSTREAM_BRANCH"
+          echo "LOCAL_BRANCH     = ${{ env.LOCAL_BRANCH }}"
+          echo "SKIP_WORKFLOWS   = ${{ env.SKIP_WORKFLOWS }}"
+          echo "UPSTREAM_REPO=$UPSTREAM_REPO"    >> "$GITHUB_ENV"
+          echo "UPSTREAM_BRANCH=$UPSTREAM_BRANCH" >> "$GITHUB_ENV"
+
+      - name: 拉取上游并推送
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
+          if ! git fetch --depth 1 upstream "refs/heads/${UPSTREAM_BRANCH}"; then
+            echo "Error: 拉取上游失败。检查三处："
+            echo "  1) 分支名大小写是否完全一致（如 Jsnzkpg 不是 main）"
+            echo "  2) 仓库是否公开"
+            echo "  3) 作者/仓库名是否拼错"
+            exit 1
+          fi
+
+          # 本地分支不存在（空仓库）时建孤儿分支
+          if ! git rev-parse --verify "refs/heads/${LOCAL_BRANCH}" >/dev/null 2>&1; then
+            git checkout --orphan "$LOCAL_BRANCH"
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            git commit --allow-empty -m "init: 初始化 ${LOCAL_BRANCH} 分支"
+          fi
+
+          git checkout "$LOCAL_BRANCH"
+          git reset --hard "upstream/${UPSTREAM_BRANCH}"
+
+          if [ "${SKIP_WORKFLOWS}" = "true" ]; then
+            rm -rf .github/workflows
+          fi
+
+          if [ -n "$(git status --porcelain)" ] || [ "${{ inputs.force }}" = "true" ]; then
+            git add -A
+            if git diff --cached --quiet; then
+              echo "无内容变化，跳过推送。"
+            else
+              git commit -m "sync: 同步上游 ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} $(date -u +%Y-%m-%dT%H:%MZ)"
+              git push origin "$LOCAL_BRANCH"
+              echo "✅ 推送完成"
+            fi
+          else
+            echo "No changes, skip push."
+          fi
+
+          echo "---"
+          echo "上游 HEAD: $(git rev-parse --short upstream/${UPSTREAM_BRANCH})"
+          echo "本地 HEAD: $(git rev-parse --short HEAD)"
+
+      - name: 结果摘要
+        if: always()
+        run: |
+          echo "### 同步结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 源：\`${{ env.UPSTREAM_SOURCE }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 本仓库分支：\`${{ env.LOCAL_BRANCH }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 运行状态：${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
